@@ -1,0 +1,38 @@
+// ============================================================================
+// Azure DevContainer Project Template - DevContainer Configuration
+// ============================================================================
+//
+// このファイルは、VS Code の Dev Containers 拡張機能で使用する設定です。
+//
+// 詳細: https://aka.ms/devcontainer.json
+//
+// ============================================================================
+
+{
+	"name": "Azure DevContainer Project",
+	"build": {
+		"context": "..",
+		"dockerfile": "../Dockerfile"
+	},
+
+	// ポートフォワーディング（Webアプリのポート番号を追加）
+	"forwardPorts": [5000, 8000, 3000],
+
+	// コンテナ作成後に実行するコマンド
+	// "postCreateCommand": "pip3 install --break-system-packages -r requirements.txt",
+
+	// VS Code 拡張機能の自動インストール
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"ms-python.python",
+				"ms-azuretools.vscode-bicep",
+				"ms-azuretools.vscode-docker",
+				"GitHub.copilot"
+			]
+		}
+	},
+
+	// コンテナのユーザー（デフォルト: node）
+	"remoteUser": "node"
+}

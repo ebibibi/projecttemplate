@@ -1,0 +1,467 @@
+name: Deploy Private Miner
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
+  LOCATION: japaneast
+  OPENAI_LOCATION: eastus
+  REGISTRY_NAME: privateminer${{ github.event.inputs.environment || 'dev' }}
+  APP_NAME: private-miner-${{ github.event.inputs.environment || 'dev' }}
+  IMAGE_NAME: private-miner-web
+
+jobs:
+  # ============================================================================
+  # Phase 1: Get or Create Entra ID Application and Create Secret
+  # ============================================================================
+  deploy-entra-id:
+    name: Setup Entra ID Application
+    runs-on: ubuntu-latest
+    outputs:
+      applicationId: ${{ steps.app-registration.outputs.applicationId }}
+      objectId: ${{ steps.app-registration.outputs.objectId }}
+      clientSecret: ${{ steps.create-secret.outputs.clientSecret }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          enable-AzPSSession: true
+
+      - name: Get or Create Entra ID Application
+        id: app-registration
+        run: |
+          DISPLAY_NAME="Private Miner (${{ env.ENVIRONMENT }})"
+          TENANT_ID=$(az account show --query tenantId -o tsv)
+
+          echo "Checking for existing Entra ID Application: $DISPLAY_NAME"
+
+          # Get application details
+          APP_JSON=$(az ad app list --filter "displayName eq '$DISPLAY_NAME'" --query "[0]" -o json)
+
+          if [ "$APP_JSON" == "null" ] || [ -z "$APP_JSON" ]; then
+            echo "⚠️  Application not found. Creating new application..."
+
+            # Define redirect URIs
+            REDIRECT_URI_1="https://private-miner-${{ env.ENVIRONMENT }}.azurewebsites.net/redirect"
+            REDIRECT_URI_2="http://localhost:5000/redirect"
+            REDIRECT_URI_3="http://127.0.0.1:5000/redirect"
+
+            # Create permissions manifest
+            cat > /tmp/permissions.json <<'EOF'
+          [
+            {
+              "resourceAppId": "00000003-0000-0000-c000-000000000000",
+              "resourceAccess": [
+                {"id": "e1fe6dd8-ba31-4d61-89e7-88639da4683d", "type": "Scope"},
+                {"id": "df85f4d6-205c-4ac5-a5ea-6bf408dba283", "type": "Scope"},
+                {"id": "c5a74245-788e-4d82-8a29-4e0de9f3d19d", "type": "Scope"},
+                {"id": "bc024368-1153-4739-b217-4326f2e966d0", "type": "Scope"},
+                {"id": "0121dc95-1b9f-4aed-8bac-58c5ac466691", "type": "Scope"},
+                {"id": "9d8982ae-4365-4f57-95e9-d6032a4c0b87", "type": "Scope"},
+                {"id": "ebf0f66e-9fb1-49e4-a278-222f76911cf4", "type": "Scope"}
+              ]
+            }
+          ]
+          EOF
+
+            # Create application
+            APP_JSON=$(az ad app create \
+              --display-name "$DISPLAY_NAME" \
+              --sign-in-audience "AzureADMultipleOrgs" \
+              --web-redirect-uris "$REDIRECT_URI_1" "$REDIRECT_URI_2" "$REDIRECT_URI_3" \
+              --required-resource-accesses @/tmp/permissions.json \
+              --enable-id-token-issuance false \
+              --enable-access-token-issuance false \
+              -o json)
+
+            APP_ID=$(echo "$APP_JSON" | jq -r '.appId')
+            OBJECT_ID=$(echo "$APP_JSON" | jq -r '.id')
+
+            echo "✅ Application created"
+            echo "  Application ID: $APP_ID"
+            echo "  Object ID: $OBJECT_ID"
+
+            # Set identifier URI
+            az ad app update --id "$APP_ID" --identifier-uris "api://$APP_ID" 2>/dev/null || echo "  ⚠️  Could not set identifier URI (not critical)"
+
+            # Create service principal
+            az ad sp create --id "$APP_ID" 2>/dev/null || echo "  Service principal already exists"
+
+            echo "  Waiting for app to propagate..."
+            sleep 10
+          else
+            APP_ID=$(echo "$APP_JSON" | jq -r '.appId')
+            OBJECT_ID=$(echo "$APP_JSON" | jq -r '.id')
+
+            echo "✅ Found existing Entra ID Application"
+            echo "  Application ID: $APP_ID"
+            echo "  Object ID: $OBJECT_ID"
+          fi
+
+          echo "  Tenant ID: $TENANT_ID"
+
+          # Set outputs for next steps
+          echo "applicationId=$APP_ID" >> $GITHUB_OUTPUT
+          echo "objectId=$OBJECT_ID" >> $GITHUB_OUTPUT
+          echo "tenantId=$TENANT_ID" >> $GITHUB_OUTPUT
+
+      - name: Create Client Secret for Entra ID App
+        id: create-secret
+        uses: azure/powershell@v2
+        with:
+          azPSVersion: 'latest'
+          inlineScript: |
+            $appId = "${{ steps.app-registration.outputs.applicationId }}"
+
+            Write-Host "Creating client secret for app $appId..."
+
+            # Create password credential
+            $credential = az ad app credential reset --id $appId --append --only-show-errors | ConvertFrom-Json
+            $clientSecret = $credential.password
+
+            echo "::add-mask::$clientSecret"
+            echo "clientSecret=$clientSecret" >> $env:GITHUB_OUTPUT
+
+            Write-Host "✓ Client secret created"
+
+      - name: Store Client Secret in Azure Key Vault
+        run: |
+          # Key Vault will be created in Phase 2, but we can check if it exists
+          # If it doesn't exist yet, we'll store the secret in Phase 2 after Key Vault is created
+          KV_NAME="kv-private-miner-${{ env.ENVIRONMENT }}"
+
+          if az keyvault show --name "$KV_NAME" &>/dev/null; then
+            echo "✓ Key Vault exists, storing secret..."
+            az keyvault secret set \
+              --vault-name "$KV_NAME" \
+              --name "client-secret-${{ env.ENVIRONMENT }}" \
+              --value "${{ steps.create-secret.outputs.clientSecret }}" \
+              --output none
+            echo "✓ Client secret stored in Key Vault"
+          else
+            echo "⚠ Key Vault doesn't exist yet, will store secret in Phase 2"
+          fi
+
+      - name: Output Summary
+        run: |
+          echo "## 🔑 Entra ID Application Ready" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Entra ID Application" >> $GITHUB_STEP_SUMMARY
+          echo "- **Application ID**: \`${{ steps.app-registration.outputs.applicationId }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Object ID**: \`${{ steps.app-registration.outputs.objectId }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Display Name**: Private Miner (${{ env.ENVIRONMENT }})" >> $GITHUB_STEP_SUMMARY
+          echo "- **Client Secret**: Created (new every deployment)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> ℹ️ Application is created if not exists, or reused if already exists (idempotent)" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================================
+  # Phase 2: Deploy Azure Resources
+  # ============================================================================
+  deploy-azure-resources:
+    name: Deploy Azure Resources
+    runs-on: ubuntu-latest
+    needs: deploy-entra-id
+    outputs:
+      applicationId: ${{ needs.deploy-entra-id.outputs.applicationId }}
+      acrName: ${{ steps.azure-deploy.outputs.acrName }}
+      openaiEndpoint: ${{ steps.azure-deploy.outputs.openaiEndpoint }}
+      appServiceUrl: ${{ steps.azure-deploy.outputs.appServiceUrl }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          enable-AzPSSession: true
+
+      - name: Get CI/CD Service Principal Object ID
+        id: get-sp-id
+        run: |
+          SP_OBJECT_ID=$(az ad sp list --filter "appId eq '${{ secrets.AZURE_CLIENT_ID }}'" --query "[0].id" -o tsv)
+          TENANT_ID=$(az account show --query tenantId -o tsv)
+
+          echo "✓ CI/CD Service Principal Object ID: $SP_OBJECT_ID"
+          echo "✓ Tenant ID: $TENANT_ID"
+
+          echo "spObjectId=$SP_OBJECT_ID" >> $GITHUB_OUTPUT
+          echo "tenantId=$TENANT_ID" >> $GITHUB_OUTPUT
+
+      - name: Deploy Azure Resources with Bicep
+        id: azure-deploy
+        uses: azure/powershell@v2
+        with:
+          azPSVersion: 'latest'
+          inlineScript: |
+            Write-Host "Deploying Azure Resources..."
+
+            $deployment = New-AzDeployment `
+              -Location $env:LOCATION `
+              -TemplateFile infra/azure-resources.bicep `
+              -TemplateParameterObject @{
+                environment = "$env:ENVIRONMENT"
+                location = "$env:LOCATION"
+                openaiLocation = "$env:OPENAI_LOCATION"
+                applicationId = "${{ needs.deploy-entra-id.outputs.applicationId }}"
+                cicdServicePrincipalId = "${{ steps.get-sp-id.outputs.spObjectId }}"
+                tenantId = "${{ steps.get-sp-id.outputs.tenantId }}"
+              } `
+              -Verbose `
+              -ErrorAction Stop
+
+            # Output resource details
+            $acrName = $deployment.Outputs.acrName.Value
+            $openaiEndpoint = $deployment.Outputs.openaiEndpoint.Value
+            $appServiceUrl = $deployment.Outputs.appServiceUrl.Value
+
+            Write-Host "✅ Azure Resources deployed"
+            Write-Host "  ACR Name: $acrName"
+            Write-Host "  OpenAI Endpoint: $openaiEndpoint"
+            Write-Host "  App Service URL: $appServiceUrl"
+
+            # Set outputs for next steps
+            echo "acrName=$acrName" >> $env:GITHUB_OUTPUT
+            echo "openaiEndpoint=$openaiEndpoint" >> $env:GITHUB_OUTPUT
+            echo "appServiceUrl=$appServiceUrl" >> $env:GITHUB_OUTPUT
+
+      - name: Store All Configuration in Azure Key Vault
+        run: |
+          KV_NAME="kv-private-miner-${{ env.ENVIRONMENT }}"
+          APP_ID="${{ needs.deploy-entra-id.outputs.applicationId }}"
+          OBJECT_ID="${{ needs.deploy-entra-id.outputs.objectId }}"
+          TENANT_ID="${{ steps.get-sp-id.outputs.tenantId }}"
+
+          echo "Storing all configuration in Key Vault $KV_NAME..."
+
+          # Get the latest client secret from Entra ID application credentials
+          # Note: We can't pass secrets between jobs, so we read the latest credential
+          echo "Retrieving latest client secret..."
+          LATEST_CREDENTIAL=$(az ad app credential list --id "$APP_ID" --query "[0]" -o json)
+
+          if [ "$LATEST_CREDENTIAL" != "null" ] && [ -n "$LATEST_CREDENTIAL" ]; then
+            # The secret value itself cannot be retrieved, but we already stored it in Phase 1
+            # Check if it's already in Key Vault
+            EXISTING_SECRET=$(az keyvault secret show --vault-name "$KV_NAME" --name "client-secret-${{ env.ENVIRONMENT }}" --query "value" -o tsv 2>/dev/null || echo "")
+
+            if [ -z "$EXISTING_SECRET" ]; then
+              echo "⚠️  Client secret not in Key Vault yet. This should have been stored in Phase 1."
+              echo "Creating a new client secret..."
+
+              # Create a new secret since we can't retrieve the old one
+              REQUEST_BODY='{"passwordCredential": {"displayName": "Generated by CI/CD"}}'
+              NEW_CREDENTIAL=$(az rest --method POST \
+                --uri "https://graph.microsoft.com/v1.0/applications/$OBJECT_ID/addPassword" \
+                --headers "Content-Type=application/json" \
+                --body "$REQUEST_BODY" \
+                -o json)
+
+              NEW_SECRET=$(echo "$NEW_CREDENTIAL" | jq -r '.secretText')
+              az keyvault secret set --vault-name "$KV_NAME" --name "client-secret-${{ env.ENVIRONMENT }}" --value "$NEW_SECRET" --output none
+              echo "  ✓ New client secret created and stored"
+            else
+              echo "  ✓ Client secret already exists in Key Vault"
+            fi
+          fi
+
+          # Store other configuration secrets
+          az keyvault secret set --vault-name "$KV_NAME" --name "client-id" --value "$APP_ID" --output none
+          az keyvault secret set --vault-name "$KV_NAME" --name "tenant-id" --value "$TENANT_ID" --output none
+
+          # Generate SESSION_SECRET if not exists
+          EXISTING_SESSION_SECRET=$(az keyvault secret show --vault-name "$KV_NAME" --name "session-secret" --query "value" -o tsv 2>/dev/null || echo "")
+          if [ -z "$EXISTING_SESSION_SECRET" ]; then
+            SESSION_SECRET=$(openssl rand -base64 48)
+            az keyvault secret set --vault-name "$KV_NAME" --name "session-secret" --value "$SESSION_SECRET" --output none
+            echo "  ✓ Generated and stored SESSION_SECRET"
+          else
+            echo "  ✓ SESSION_SECRET already exists"
+          fi
+
+          # Store optional configuration (with defaults)
+          az keyvault secret set --vault-name "$KV_NAME" --name "authority" --value "https://login.microsoftonline.com/organizations" --output none
+          az keyvault secret set --vault-name "$KV_NAME" --name "redirect-uri" --value "https://private-miner-${{ env.ENVIRONMENT }}.azurewebsites.net/redirect" --output none
+          az keyvault secret set --vault-name "$KV_NAME" --name "scope" --value "User.Read Files.Read.All Sites.Read.All GroupMember.Read.All Team.ReadBasic.All Channel.ReadBasic.All ChannelMessage.Send" --output none
+          az keyvault secret set --vault-name "$KV_NAME" --name "endpoint" --value "https://graph.microsoft.com/v1.0/me" --output none
+
+          echo "✓ All configuration stored in Key Vault"
+
+      - name: Store Azure OpenAI API Key in Key Vault
+        run: |
+          KV_NAME="kv-private-miner-${{ env.ENVIRONMENT }}"
+
+          echo "Retrieving Azure OpenAI API Key..."
+          OPENAI_KEY=$(az cognitiveservices account keys list \
+            --name private-miner-openai-${{ env.ENVIRONMENT }} \
+            --resource-group private-miner-openai-rg \
+            --query key1 -o tsv)
+
+          echo "Storing Azure OpenAI API Key in Key Vault..."
+          az keyvault secret set --vault-name "$KV_NAME" --name "azure-openai-api-key" --value "$OPENAI_KEY" --output none
+          echo "  ✓ AZURE_OPENAI_API_KEY stored in Key Vault"
+
+      - name: Update App Service Environment Variables
+        uses: azure/powershell@v2
+        with:
+          azPSVersion: 'latest'
+          inlineScript: |
+            $appName = "$env:APP_NAME"
+            $rgName = "private-miner-$env:ENVIRONMENT-rg"
+            $environment = "$env:ENVIRONMENT"
+            $appId = "${{ needs.deploy-entra-id.outputs.applicationId }}"
+            $kvName = "kv-private-miner-$environment"
+
+            Write-Host "Updating App Service environment variables..."
+            Write-Host "  ENVIRONMENT: $environment"
+            Write-Host "  CLIENT_ID: $appId"
+            Write-Host "  CLIENT_SECRET: @Microsoft.KeyVault reference"
+            Write-Host "  TENANT_ID: @Microsoft.KeyVault reference"
+            Write-Host "  SESSION_SECRET: @Microsoft.KeyVault reference"
+            Write-Host "  AUTHORITY: @Microsoft.KeyVault reference"
+            Write-Host "  REDIRECT_URI: @Microsoft.KeyVault reference"
+            Write-Host "  SCOPE: @Microsoft.KeyVault reference"
+            Write-Host "  ENDPOINT: @Microsoft.KeyVault reference"
+            Write-Host "  AZURE_OPENAI_API_KEY: @Microsoft.KeyVault reference"
+
+            # Set ALL environment variables - some as direct values, most as Key Vault references
+            # App Service will automatically resolve @Microsoft.KeyVault(...) references
+            az webapp config appsettings set `
+              --name $appName `
+              --resource-group $rgName `
+              --settings `
+                ENVIRONMENT="$environment" `
+                CLIENT_ID="$appId" `
+                CLIENT_SECRET="@Microsoft.KeyVault(VaultName=$kvName;SecretName=client-secret-$environment)" `
+                TENANT_ID="@Microsoft.KeyVault(VaultName=$kvName;SecretName=tenant-id)" `
+                SESSION_SECRET="@Microsoft.KeyVault(VaultName=$kvName;SecretName=session-secret)" `
+                AUTHORITY="@Microsoft.KeyVault(VaultName=$kvName;SecretName=authority)" `
+                REDIRECT_URI="@Microsoft.KeyVault(VaultName=$kvName;SecretName=redirect-uri)" `
+                SCOPE="@Microsoft.KeyVault(VaultName=$kvName;SecretName=scope)" `
+                ENDPOINT="@Microsoft.KeyVault(VaultName=$kvName;SecretName=endpoint)" `
+                AZURE_OPENAI_API_KEY="@Microsoft.KeyVault(VaultName=$kvName;SecretName=azure-openai-api-key)" `
+              --output none
+
+            Write-Host "✓ All environment variables updated with Key Vault references"
+
+      - name: Output Summary
+        run: |
+          echo "## 🎉 Azure Resources Deployed!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Azure Resources" >> $GITHUB_STEP_SUMMARY
+          echo "- **Resource Group**: \`private-miner-${{ env.ENVIRONMENT }}-rg\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Container Registry**: \`${{ steps.azure-deploy.outputs.acrName }}.azurecr.io\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **OpenAI Endpoint**: \`${{ steps.azure-deploy.outputs.openaiEndpoint }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **App Service**: \`${{ steps.azure-deploy.outputs.appServiceUrl }}\`" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================================
+  # Phase 3: Build and Deploy Application
+  # ============================================================================
+  build-and-deploy-app:
+    name: Build and Deploy Application
+    runs-on: ubuntu-latest
+    needs: deploy-azure-resources
+    environment:
+      name: ${{ github.event.inputs.environment || 'dev' }}
+      url: https://${{ env.APP_NAME }}.azurewebsites.net
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ACR
+        run: az acr login --name ${{ env.REGISTRY_NAME }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./src
+          file: ./src/web/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.REGISTRY_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=registry,ref=${{ env.REGISTRY_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+      - name: Update Container Image
+        run: |
+          echo "Updating App Service to use new container image..."
+          az webapp config container set \
+            --name ${{ env.APP_NAME }} \
+            --resource-group private-miner-${{ env.ENVIRONMENT }}-rg \
+            --container-image-name ${{ env.REGISTRY_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          echo "✓ Container image updated to SHA: ${{ github.sha }}"
+
+      - name: Wait for Container Update
+        run: sleep 30
+
+      - name: Restart App Service
+        run: |
+          echo "Restarting App Service to apply new container..."
+          az webapp restart \
+            --name ${{ env.APP_NAME }} \
+            --resource-group private-miner-${{ env.ENVIRONMENT }}-rg
+          echo "✓ App Service restarted"
+
+      - name: Wait for App Service to start
+        run: sleep 60
+
+      - name: Test deployment
+        run: |
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://${{ env.APP_NAME }}.azurewebsites.net)
+          echo "HTTP Status: $HTTP_STATUS"
+          if [ "$HTTP_STATUS" -eq 302 ] || [ "$HTTP_STATUS" -eq 200 ]; then
+            echo "✅ Deployment successful! App is responding."
+          else
+            echo "⚠️  Deployment may have issues. HTTP status: $HTTP_STATUS"
+            exit 1
+          fi
+
+      - name: Output deployment URL
+        run: |
+          echo "## 🚀 Application Deployed Successfully!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **URL**: https://${{ env.APP_NAME }}.azurewebsites.net" >> $GITHUB_STEP_SUMMARY
+          echo "- **Docker Image**: \`${{ env.REGISTRY_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Run admin consent: \`https://${{ env.APP_NAME }}.azurewebsites.net/auth/login?admin_consent=1\`" >> $GITHUB_STEP_SUMMARY
+          echo "2. Test login: \`https://${{ env.APP_NAME }}.azurewebsites.net/auth/login\`" >> $GITHUB_STEP_SUMMARY

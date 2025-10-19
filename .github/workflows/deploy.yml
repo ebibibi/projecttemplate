@@ -1,0 +1,51 @@
+# ============================================================================
+# Azure DevContainer Project - CI/CD Pipeline
+# ============================================================================
+#
+# このワークフローは、Azure へのデプロイを自動化します。
+#
+# 3つのジョブで構成:
+# 1. deploy-entra-id: Entra ID アプリケーション登録
+# 2. deploy-azure-resources: Bicep による Azure リソースデプロイ
+# 3. build-and-deploy-app: Docker イメージビルド → ACR → App Service
+#
+# TODO: プロジェクト名を変更してください（23-26行目）
+#
+# ============================================================================
+
+name: Deploy to Azure
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  ENVIRONMENT: 'dev'
+  LOCATION: japaneast
+  # TODO: プロジェクト名を変更してください
+  REGISTRY_NAME: yourprojectname  # ACR名（英数字のみ）
+  APP_NAME: your-project-name     # App Service名
+  IMAGE_NAME: your-project-name-web  # Dockerイメージ名
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          enable-AzPSSession: true
+      
+      # TODO: ここにデプロイステップを追加
+      # 参考: https://github.com/Azure/actions
